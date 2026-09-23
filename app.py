@@ -35,7 +35,6 @@ if getattr(sys, 'frozen', False):
 else:
     DIRECTORIO_BASE = os.path.dirname(os.path.abspath(__file__))
 
-ARCHIVO_REPORTE = os.path.join(DIRECTORIO_BASE, 'Reporte_Duplicados.csv') 
 ARCHIVO_LOG = os.path.join(DIRECTORIO_BASE, 'historial_auditoria.txt')
 ARCHIVO_TOKEN = os.path.join(DIRECTORIO_BASE, 'token.json')
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -225,17 +224,19 @@ class AppAuditoriaAvanzada:
         user = self.config.get("usuario_red")
         pwd = self.config.get("password_red")
         rutas = self.config.get("rutas_nas", [])
+        
         if user and pwd:
             for ruta in rutas:
                 comando = ["net", "use", ruta, pwd, f"/user:{user}"]
                 subprocess.run(comando, capture_output=True, text=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
 
     def obtener_servicio_drive(self):
+        """Autenticación blindada con auto-curación de Tokens (invalid_grant)"""
         creds = None
         ruta_credenciales = self.config.get("ruta_credenciales_google")
         
         if not os.path.exists(ruta_credenciales):
-            raise FileNotFoundError("No se encontró credentials.json. Verifique la ruta en Ajustes.")
+            raise FileNotFoundError("No se encontró credentials.json. Por favor, verifique la ruta en Ajustes.")
             
         if os.path.exists(ARCHIVO_TOKEN):
             creds = Credentials.from_authorized_user_file(ARCHIVO_TOKEN, SCOPES)
@@ -250,17 +251,22 @@ class AppAuditoriaAvanzada:
                         flow = InstalledAppFlow.from_client_secrets_file(ruta_credenciales, SCOPES)
                         creds = flow.run_local_server(port=0)
                     break 
+                
                 except (RefreshError, Exception) as e:
                     error_str = str(e)
-                    if "SSL" in error_str or "EOF" in error_str or "RefreshError" in error_str or "Connection" in error_str:
+                    # Agregamos "invalid_grant" y "Bad Request" a las validaciones de token expirado
+                    if any(clave in error_str for clave in ["SSL", "EOF", "RefreshError", "Connection", "invalid_grant", "Bad Request"]):
                         if intento < max_reintentos - 1:
-                            self.cola_mensajes.put(("log", f"[DRIVE] ⚠️ Fluctuación de red. Reintentando ({intento+1}/{max_reintentos})..."))
+                            self.cola_mensajes.put(("log", f"[DRIVE] ⚠️ Token expirado o fallo de red. Auto-reparando ({intento+1}/{max_reintentos})..."))
                             time.sleep(3) 
-                            if "RefreshError" in error_str and os.path.exists(ARCHIVO_TOKEN):
-                                os.remove(ARCHIVO_TOKEN)
+                            
+                            # Si es problema de token o expiración forzamos el borrado físico para renovar la sesión
+                            if any(clave in error_str for clave in ["RefreshError", "invalid_grant", "Bad Request"]):
+                                if os.path.exists(ARCHIVO_TOKEN):
+                                    os.remove(ARCHIVO_TOKEN)
                                 creds = None 
                         else:
-                            raise Exception(f"Fallo persistente: {e}")
+                            raise Exception(f"Fallo de autenticación persistente con Google: {e}")
                     else:
                         raise e 
 
@@ -299,7 +305,7 @@ class AppAuditoriaAvanzada:
         
         def agregar_ruta():
             ruta = self.ent_nueva_ruta.get().strip()
-            # Validación estricta para evitar errores humanos
+            # Validación estricta para evitar errores humanos en la ruta
             if not ruta:
                 return
             if not (ruta.startswith("\\\\") or ":" in ruta):
@@ -441,7 +447,7 @@ class AppAuditoriaAvanzada:
         f_consola = ttk.LabelFrame(self.root, text=" 💻 Monitor de Avance (Multihilo) ")
         f_consola.pack(fill="x", padx=10, pady=5)
         
-        # --- NUEVO: Barra de progreso visual para mejor UX ---
+        # Barra de progreso visual para mejor UX
         self.progreso = ttk.Progressbar(f_consola, orient="horizontal", mode="indeterminate")
         self.progreso.pack(fill="x", padx=5, pady=2)
 
@@ -461,9 +467,6 @@ class AppAuditoriaAvanzada:
         self.btn_borrar = ttk.Button(f_acciones, text="🗑️ Mover a Cuarentena/Papelera", state="disabled", command=self.borrar_seguro)
         self.btn_borrar.pack(side="right", padx=5)
 
-    # ------------------------------------------
-    # MÓDULO CORE: LÓGICA DE ESCANEO
-    # ------------------------------------------
     def alternar_pausa(self):
         if self.evento_pausa.is_set():
             self.evento_pausa.clear() 
@@ -476,6 +479,35 @@ class AppAuditoriaAvanzada:
             self.progreso.start()
             self.cola_mensajes.put(("log", "[SISTEMA] ▶️ ESCANEO REANUDADO"))
 
+    # ------------------------------------------
+    # MÓDULO DE PAGINACIÓN VISUAL
+    # ------------------------------------------
+    def preparar_paginacion(self):
+        self.lista_duplicados_plana = []
+        for h, lista in self.duplicados_detectados.items():
+            if len(lista) > 1:
+                for arch in lista:
+                    self.lista_duplicados_plana.append(arch)
+        
+        total_items = len(self.lista_duplicados_plana)
+        self.total_paginas = max(1, math.ceil(total_items / self.items_por_pagina))
+        
+        if self.pagina_actual > self.total_paginas:
+            self.pagina_actual = self.total_paginas
+
+    def pagina_anterior(self):
+        if self.pagina_actual > 1:
+            self.pagina_actual -= 1
+            self.poblar_tabla(desde_paginacion=True)
+
+    def pagina_siguiente(self):
+        if self.pagina_actual < self.total_paginas:
+            self.pagina_actual += 1
+            self.poblar_tabla(desde_paginacion=True)
+
+    # ------------------------------------------
+    # MÓDULO CORE: ESCANEO EN PARALELO
+    # ------------------------------------------
     def iniciar_escaneo(self):
         try:
             conn = sqlite3.connect(self.archivo_bd, timeout=15.0)
@@ -492,7 +524,7 @@ class AppAuditoriaAvanzada:
             pass 
             
         self.escaneo_en_curso = True
-        self.progreso.start() # Activar feedback visual
+        self.progreso.start() 
         
         self.btn_iniciar.config(state="disabled")
         self.btn_ajustes.config(state="disabled")
@@ -523,6 +555,7 @@ class AppAuditoriaAvanzada:
                 self.evento_pausa.wait() 
                 max_reintentos = 3
                 resultados = None
+                
                 for intento in range(max_reintentos):
                     try:
                         resultados = servicio.files().list(q="trashed = false", fields="nextPageToken, files(id, name, size, md5Checksum, webViewLink, modifiedTime)", pageToken=page_token).execute()
@@ -547,7 +580,8 @@ class AppAuditoriaAvanzada:
                     self.cola_mensajes.put(("log", f"[DRIVE] ☁️ Metadatos descargados: {total_drive}"))
                 
                 page_token = resultados.get('nextPageToken')
-                if not page_token: break
+                if not page_token:
+                    break
             self.cola_mensajes.put(("log", f"[DRIVE] ✅ Finalizado. ({total_drive} archivos)"))
         except Exception as e:
             self.cola_mensajes.put(("error_log", f"[DRIVE] ❌ Error: {e}"))
@@ -662,10 +696,10 @@ class AppAuditoriaAvanzada:
         except PermissionError:
              self.cola_mensajes.put(("error_log", "[SISTEMA] ⚠️ El archivo Excel está abierto. Ciérrelo para poder actualizar el reporte."))
         except Exception as e:
-            self.cola_mensajes.put(("error_log", f"[SISTEMA] ⚠️ Error reporte: {e}"))
+            self.cola_mensajes.put(("error_log", f"[SISTEMA] ⚠️ Error creando reporte excel: {e}"))
 
     # ------------------------------------------
-    # MÓDULO DE UI, PAGINACIÓN Y MANEJO DE ERRORES
+    # MÓDULO DE ACTUALIZACIÓN UI Y AUDITORÍA
     # ------------------------------------------
     def procesar_cola(self):
         try:
@@ -701,31 +735,14 @@ class AppAuditoriaAvanzada:
             pass
         self.root.after(100, self.procesar_cola)
 
-    def preparar_paginacion(self):
-        self.lista_duplicados_plana = []
-        for h, lista in self.duplicados_detectados.items():
-            if len(lista) > 1:
-                for arch in lista:
-                    self.lista_duplicados_plana.append(arch)
-        total_items = len(self.lista_duplicados_plana)
-        self.total_paginas = max(1, math.ceil(total_items / self.items_por_pagina))
-        if self.pagina_actual > self.total_paginas: self.pagina_actual = self.total_paginas
-
-    def pagina_anterior(self):
-        if self.pagina_actual > 1:
-            self.pagina_actual -= 1
-            self.poblar_tabla(desde_paginacion=True)
-
-    def pagina_siguiente(self):
-        if self.pagina_actual < self.total_paginas:
-            self.pagina_actual += 1
-            self.poblar_tabla(desde_paginacion=True)
-
     def poblar_tabla(self, desde_paginacion=False):
-        for i in self.tree.get_children(): self.tree.delete(i)
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+            
         inicio = (self.pagina_actual - 1) * self.items_por_pagina
         fin = inicio + self.items_por_pagina
         pagina_datos = self.lista_duplicados_plana[inicio:fin]
+        
         for arch in pagina_datos:
             self.tree.insert("", "end", values=(arch['hash'], arch['origen'], arch['nombre'], arch['size'], arch.get('fecha', 'N/A'), arch['link']), tags=(arch['id'],))
         
@@ -738,8 +755,12 @@ class AppAuditoriaAvanzada:
             self.btn_ajustes.config(state="normal")
             self.btn_sync.config(state="normal")
             self.btn_pausa.config(state="disabled")
-            if os.path.exists(self.archivo_reporte): self.btn_abrir_excel.config(state="normal")
+            if os.path.exists(self.archivo_reporte):
+                self.btn_abrir_excel.config(state="normal")
 
+    # ------------------------------------------
+    # ACCIONES: VISTA PREVIA Y BORRADO FORENSE
+    # ------------------------------------------
     def al_seleccionar_item(self, event):
         if self.tree.selection():
             self.btn_preview.config(state="normal")
@@ -766,6 +787,7 @@ class AppAuditoriaAvanzada:
 
         if messagebox.askyesno("Confirmación Crítica", f"¿Mover '{nombre}' a cuarentena/papelera?"):
             try:
+                # 1. Borrado físico o movimiento (Módulo Forense activado)
                 if origen == "Drive":
                     servicio = self.obtener_servicio_drive()
                     servicio.files().update(fileId=id_real, body={'trashed': True}).execute()
@@ -773,7 +795,7 @@ class AppAuditoriaAvanzada:
                 else:
                     cuarentena_dir = os.path.join(DIRECTORIO_BASE, '_CUARENTENA_DUPLICADOS')
                     os.makedirs(cuarentena_dir, exist_ok=True)
-                    # --- NUEVO: Control de error de Permisos (Archivo en uso) ---
+                    # --- Control de error de Permisos (Archivo en uso) ---
                     try:
                         os.rename(link, os.path.join(cuarentena_dir, nombre))
                         self.cola_mensajes.put(("log", f"[ACCIÓN] 📦 [{self.nombre_equipo}\\{self.usuario_local}] movió a Cuarentena NAS: {link}"))
@@ -781,9 +803,13 @@ class AppAuditoriaAvanzada:
                         messagebox.showwarning("Archivo Bloqueado", f"No se puede mover el archivo:\n\n{nombre}\n\nActualmente está abierto o en uso por otro empleado/programa. Ciérrelo e intente de nuevo.")
                         return 
                 
+                # 2. Eliminación de la vista
                 self.tree.delete(item)
+                
+                # 3. Eliminación SEGURA de la Base de Datos SQLite compartida
                 self.eliminar_registro_bd(id_real)
                 
+                # 4. Actualizar memoria RAM local
                 self.lista_duplicados_plana = [arch for arch in self.lista_duplicados_plana if arch['id'] != id_real]
                 self.total_paginas = max(1, math.ceil(len(self.lista_duplicados_plana) / self.items_por_pagina))
                 self.lbl_pagina.config(text=f"Página {self.pagina_actual} de {self.total_paginas}")
