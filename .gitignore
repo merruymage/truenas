@@ -1,0 +1,24 @@
+# Entornos virtuales de Python
+.venv/
+venv/
+ENV/
+
+# Carpetas de compilación de PyInstaller
+build/
+build1/
+dist/
+
+# Archivos de configuración de PyInstaller
+*.spec
+*.toc
+# Credenciales de Google API y Tokens de acceso
+credentials.json
+token.json
+token11.json
+
+# Archivos de datos y reportes generados
+*.csv
+*.db
+*.xlsx
+*.sqlite
+Reportes_Automatizados/
